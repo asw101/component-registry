@@ -63,7 +63,7 @@ jobs:
           - runner: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          - runner: macos-13
+          - runner: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
           - runner: windows-latest
@@ -75,6 +75,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -85,20 +87,20 @@ jobs:
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --release --package wasm
+        run: cargo build --release --package wasm --target ${{ matrix.target }}
 
       - name: Package binary (unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          cd target/release
-          tar czf ../../wasm-${{ matrix.target }}.tar.gz wasm
-          cd ../..
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../wasm-${{ matrix.target }}.tar.gz wasm
+          cd ../../..
 
       - name: Package binary (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/wasm.exe -DestinationPath wasm-${{ matrix.target }}.zip
+          Compress-Archive -Path target/${{ matrix.target }}/release/wasm.exe -DestinationPath wasm-${{ matrix.target }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
