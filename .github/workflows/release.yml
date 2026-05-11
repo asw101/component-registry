@@ -35,20 +35,21 @@ jobs:
             fi
             resolved="$INPUT_VERSION"
           else
-            # Find latest X.Y.Z tag, increment minor
-            latest=$(git tag --list '[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+            # Find latest vX.Y.Z tag, strip v prefix, increment minor
+            latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
             if [ -z "$latest" ]; then
               resolved="0.1.0"
             else
-              major=$(echo "$latest" | cut -d. -f1)
-              minor=$(echo "$latest" | cut -d. -f2)
+              stripped="${latest#v}"
+              major=$(echo "$stripped" | cut -d. -f1)
+              minor=$(echo "$stripped" | cut -d. -f2)
               next_minor=$((minor + 1))
               resolved="${major}.${next_minor}.0"
             fi
           fi
 
-          if git ls-remote --tags --exit-code origin "refs/tags/${resolved}" >/dev/null 2>&1; then
-            echo "Error: tag '${resolved}' already exists on origin." >&2
+          if git ls-remote --tags --exit-code origin "refs/tags/v${resolved}" >/dev/null 2>&1; then
+            echo "Error: tag 'v${resolved}' already exists on origin." >&2
             exit 1
           fi
 
@@ -97,6 +98,7 @@ jobs:
           version = os.environ["VERSION"]
           path = pathlib.Path("Cargo.toml")
           text = path.read_text()
+          # Update [workspace.package] version
           new_text, count = re.subn(
               r'(\[workspace\.package\][^\[]*?\nversion\s*=\s*")[^"]*(")',
               lambda m: m.group(1) + version + m.group(2),
@@ -106,6 +108,12 @@ jobs:
           )
           if count != 1:
               raise SystemExit("Failed to update [workspace.package] version in Cargo.toml")
+          # Update version constraints on local path deps in [workspace.dependencies]
+          new_text = re.sub(
+              r'(path\s*=\s*"[^"]*",\s*version\s*=\s*")[^"]*(")',
+              lambda m: m.group(1) + version + m.group(2),
+              new_text,
+          )
           path.write_text(new_text)
           print(f"Set workspace version to {version}")
 
@@ -179,6 +187,6 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: "${{ needs.resolve-version.outputs.version }}"
+          tag_name: "v${{ needs.resolve-version.outputs.version }}"
           generate_release_notes: true
           files: release-assets/*
