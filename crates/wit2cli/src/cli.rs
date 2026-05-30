@@ -75,9 +75,11 @@ pub fn build_clap(surface: &LibrarySurface, program_name: &str) -> Result<Comman
 
     for item in &surface.items {
         match item {
-            LibraryItem::Func(f) => {
-                root = root.subcommand(build_func_command(f)?);
-            }
+            LibraryItem::Func(f) => match build_func_command(f) {
+                Ok(cmd) => root = root.subcommand(cmd),
+                Err(CliError::UnsupportedArg { .. }) => {}
+                Err(e) => return Err(e),
+            },
             LibraryItem::Interface {
                 name, doc, funcs, ..
             } => {
@@ -87,10 +89,20 @@ pub fn build_clap(surface: &LibrarySurface, program_name: &str) -> Result<Comman
                 if let Some(doc) = doc {
                     iface_cmd = iface_cmd.about(doc.trim().to_string());
                 }
+                let mut added = 0usize;
                 for f in funcs {
-                    iface_cmd = iface_cmd.subcommand(build_func_command(f)?);
+                    match build_func_command(f) {
+                        Ok(cmd) => {
+                            iface_cmd = iface_cmd.subcommand(cmd);
+                            added += 1;
+                        }
+                        Err(CliError::UnsupportedArg { .. }) => {}
+                        Err(e) => return Err(e),
+                    }
                 }
-                root = root.subcommand(iface_cmd);
+                if added > 0 {
+                    root = root.subcommand(iface_cmd);
+                }
             }
         }
     }
@@ -154,6 +166,28 @@ fn add_param_args(
                 };
                 let arg = positional_for_primitive(&inner_param);
                 cmd = cmd.arg(arg.required(false));
+                Ok(cmd)
+            }
+            // option<record>: expand each inner field as an optional
+            // --param-field flag. If none are provided the whole option
+            // collapses to None at collection time.
+            WitTy::Record(fields) => {
+                for (fname, fty) in fields {
+                    let flag = format!("{}-{}", param.name, fname);
+                    if !seen.insert(flag.clone()) {
+                        return Err(CliError::FlagCollision { flag });
+                    }
+                    let effective = match fty {
+                        WitTy::Option(inner_inner) => inner_inner.as_ref(),
+                        other => other,
+                    };
+                    let arg = Arg::new(flag.clone())
+                        .long(flag)
+                        .required(false)
+                        .num_args(1)
+                        .help(format!("field `{fname}` of optional `{}`", param.name));
+                    cmd = cmd.arg(attach_value_parser(arg, effective));
+                }
                 Ok(cmd)
             }
             other => Err(CliError::UnsupportedArg {
@@ -460,8 +494,36 @@ fn collect_one(
 ) -> Result<Val, CliError> {
     match &param.ty {
         WitTy::Option(inner) => {
-            // Try to read a positional value; if absent, return None.
             let id = param.name.as_str();
+            // option<record>: flags are --{param}-{field}; collapse to None
+            // if none of them were supplied.
+            if let WitTy::Record(fields) = inner.as_ref() {
+                let any = fields
+                    .iter()
+                    .any(|(fname, _)| matches.contains_id(&format!("{id}-{fname}")));
+                if !any {
+                    return Ok(Val::Option(None));
+                }
+                let mut pairs = Vec::with_capacity(fields.len());
+                for (fname, fty) in fields {
+                    let flag = format!("{id}-{fname}");
+                    let v = match fty {
+                        WitTy::Option(inner_ty) => {
+                            if matches.contains_id(&flag) {
+                                Val::Option(Some(Box::new(collect_typed(
+                                    matches, &flag, inner_ty,
+                                )?)))
+                            } else {
+                                Val::Option(None)
+                            }
+                        }
+                        other => collect_typed(matches, &flag, other)?,
+                    };
+                    pairs.push((fname.clone(), v));
+                }
+                return Ok(Val::Option(Some(Box::new(Val::Record(pairs)))));
+            }
+            // Primitives and other option<T>: read a single positional value.
             if matches.contains_id(id) {
                 let inner_param = ParamDecl {
                     name: param.name.clone(),
@@ -683,7 +745,29 @@ fn collect_typed_many(matches: &ArgMatches, id: &str, ty: &WitTy) -> Result<Vec<
             }
             out
         }
+        // list<record>: each flag value is a JSON object string.
+        WitTy::Record(fields) => {
+            let record_ty = WitTy::Record(fields.clone());
+            let raws: Vec<String> = matches
+                .get_many::<String>(id)
+                .map(|it| it.cloned().collect())
+                .unwrap_or_default();
+            raws.iter()
+                .map(|raw| {
+                    let json = serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+                        CliError::InvalidValue {
+                            param: id.to_string(),
+                            reason: format!("expected JSON object: {e}"),
+                        }
+                    })?;
+                    json_val_to_wit(id, &record_ty, &json)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
         other => {
+            if matches.get_many::<String>(id).is_none() {
+                return Ok(vec![]);
+            }
             return Err(CliError::UnsupportedArg {
                 param: id.to_string(),
                 reason: format!(
@@ -693,6 +777,99 @@ fn collect_typed_many(matches: &ArgMatches, id: &str, ty: &WitTy) -> Result<Vec<
             });
         }
     })
+}
+
+/// Convert a JSON value to a [`Val`] driven by a [`WitTy`] schema.
+/// Used for `list<record>` parameters whose elements arrive as JSON strings.
+fn json_val_to_wit(param: &str, ty: &WitTy, json: &serde_json::Value) -> Result<Val, CliError> {
+    let err = |reason: String| CliError::InvalidValue {
+        param: param.to_string(),
+        reason,
+    };
+    let take_unsigned = || {
+        json.as_u64()
+            .ok_or_else(|| err(format!("expected unsigned integer, got `{json}`")))
+    };
+    let take_signed = || {
+        json.as_i64()
+            .ok_or_else(|| err(format!("expected signed integer, got `{json}`")))
+    };
+    let take_real = || {
+        json.as_f64()
+            .ok_or_else(|| err(format!("expected number, got `{json}`")))
+    };
+    let take_text = || {
+        json.as_str()
+            .ok_or_else(|| err(format!("expected string, got `{json}`")))
+    };
+    let narrow_u = |v: u64, label: &str| {
+        u32::try_from(v).map_err(|_| err(format!("integer `{v}` out of range for {label}")))
+    };
+    let narrow_i = |v: i64, label: &str| {
+        i32::try_from(v).map_err(|_| err(format!("integer `{v}` out of range for {label}")))
+    };
+    match ty {
+        WitTy::Bool => {
+            Ok(Val::Bool(json.as_bool().ok_or_else(|| {
+                err(format!("expected bool, got `{json}`"))
+            })?))
+        }
+        WitTy::U8 => Ok(Val::U8(
+            u8::try_from(take_unsigned()?).map_err(|e| err(format!("u8 out of range: {e}")))?,
+        )),
+        WitTy::U16 => Ok(Val::U16(
+            u16::try_from(take_unsigned()?).map_err(|e| err(format!("u16 out of range: {e}")))?,
+        )),
+        WitTy::U32 => Ok(Val::U32(narrow_u(take_unsigned()?, "u32")?)),
+        WitTy::U64 => Ok(Val::U64(take_unsigned()?)),
+        WitTy::S8 => Ok(Val::S8(
+            i8::try_from(take_signed()?).map_err(|e| err(format!("s8 out of range: {e}")))?,
+        )),
+        WitTy::S16 => Ok(Val::S16(
+            i16::try_from(take_signed()?).map_err(|e| err(format!("s16 out of range: {e}")))?,
+        )),
+        WitTy::S32 => Ok(Val::S32(narrow_i(take_signed()?, "s32")?)),
+        WitTy::S64 => Ok(Val::S64(take_signed()?)),
+        #[allow(clippy::cast_possible_truncation)]
+        WitTy::F32 => Ok(Val::Float32(take_real()? as f32)),
+        WitTy::F64 => Ok(Val::Float64(take_real()?)),
+        WitTy::String => Ok(Val::String(take_text()?.to_string())),
+        WitTy::Enum(_) => Ok(Val::Enum(take_text()?.to_string())),
+        WitTy::Option(inner) => match json {
+            serde_json::Value::Null => Ok(Val::Option(None)),
+            v => Ok(Val::Option(Some(Box::new(json_val_to_wit(
+                param, inner, v,
+            )?)))),
+        },
+        WitTy::Record(fields) => {
+            let obj = json
+                .as_object()
+                .ok_or_else(|| err(format!("expected JSON object, got `{json}`")))?;
+            fields
+                .iter()
+                .map(|(fname, fty)| {
+                    let v = json_val_to_wit(
+                        &format!("{param}.{fname}"),
+                        fty,
+                        obj.get(fname.as_str()).unwrap_or(&serde_json::Value::Null),
+                    )?;
+                    Ok((fname.clone(), v))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Val::Record)
+        }
+        WitTy::List(inner) => json
+            .as_array()
+            .ok_or_else(|| err(format!("expected JSON array, got `{json}`")))?
+            .iter()
+            .map(|v| json_val_to_wit(param, inner, v))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Val::List),
+        _ => Err(CliError::UnsupportedArg {
+            param: param.to_string(),
+            reason: format!("{} not supported in JSON input", debug_kind(ty)),
+        }),
+    }
 }
 
 /// Parse a raw CLI string into a [`Val`] for a primitive type.
