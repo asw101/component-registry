@@ -4,9 +4,31 @@
 //! that `component run` can map onto a `clap` CLI. Resources are
 //! rejected because they cannot be sensibly represented on the
 //! command line.
+//!
+//! ## Implementation
+//!
+//! The walk is built directly on `wasmparser::Validator`: we stream
+//! the component bytes through the validator, record the root
+//! component's export names as we encounter the
+//! `ComponentExportSection`, then look each one up post-validation
+//! via [`TypesRef::component_entity_type_of_export`]. This avoids the
+//! `wit_component`/`wit_parser` round-trip and keeps the dependency
+//! surface honest: every WIT-shape decision is grounded in the
+//! validated type tables that wasmtime itself uses at runtime.
+//!
+//! See `_/wasmtime/crates/environ/src/component/translate.rs` for
+//! the canonical reference of this validator-driven pattern.
 
-use wit_parser::decoding::{DecodedWasm, decode};
-use wit_parser::{Resolve, Type, TypeDefKind, WorldItem, WorldKey};
+use std::collections::HashMap;
+
+use wasmparser::component_types::{
+    ComponentDefinedType, ComponentDefinedTypeId, ComponentEntityType, ComponentFuncType,
+    ComponentFuncTypeId, ComponentInstanceType, ComponentInstanceTypeId, ComponentValType,
+};
+use wasmparser::types::TypesRef;
+use wasmparser::{
+    Encoding, Parser, Payload, PrimitiveValType, ValidPayload, Validator, WasmFeatures,
+};
 
 /// Logical path to a single exported function on a component.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,216 +193,356 @@ pub enum LibraryExtractError {
     },
 }
 
-/// Decode `bytes` and walk the world's exports into a
+/// Decode `bytes` and walk the root component's exports into a
 /// [`LibrarySurface`].
+///
+/// Streams the bytes through a [`Validator`] so that we get fully
+/// resolved [`ComponentEntityType`] values back from
+/// [`TypesRef::component_entity_type_of_export`] — no separate WIT
+/// round-trip is required.
 pub fn extract_library_surface(bytes: &[u8]) -> Result<LibrarySurface, LibraryExtractError> {
-    let decoded = decode(bytes).map_err(|e| LibraryExtractError::Decode(e.to_string()))?;
-    let (resolve, world_id) = match decoded {
-        DecodedWasm::Component(r, w) => (r, w),
-        DecodedWasm::WitPackage(_, _) => return Err(LibraryExtractError::NotAComponent),
-    };
+    let walk = walk_component(bytes)?;
+    let types = walk.types;
+    let r = types.as_ref();
+    let docs = parse_package_docs(walk.package_docs.as_deref());
 
-    let world = resolve
-        .worlds
-        .get(world_id)
-        .ok_or_else(|| LibraryExtractError::Decode("world id not in resolve".to_string()))?;
-
-    let mut items = Vec::new();
-    for (key, item) in &world.exports {
-        match item {
-            WorldItem::Function(func) => {
-                let decl = func_to_decl(&resolve, &func.name, func)?;
-                items.push(LibraryItem::Func(decl));
-            }
-            WorldItem::Interface { id, .. } => {
-                let iface = resolve.interfaces.get(*id).ok_or_else(|| {
-                    LibraryExtractError::Decode("interface id not in resolve".to_string())
-                })?;
-                let iface_name = world_key_label(&resolve, key, iface.name.as_deref());
-                let export_name = world_key_export_name(&resolve, key, iface);
-                let mut funcs = Vec::with_capacity(iface.functions.len());
-                for func in iface.functions.values() {
-                    funcs.push(func_to_decl(&resolve, &func.name, func)?);
+    let mut items: Vec<LibraryItem> = Vec::new();
+    for name in &walk.root_exports {
+        let entity = r
+            .component_entity_type_of_export(name)
+            .ok_or_else(|| LibraryExtractError::Decode(format!("export `{name}` not in types")))?;
+        match entity {
+            ComponentEntityType::Func(fid) => {
+                let func_doc = docs.get("").and_then(|m| m.get(name.as_str())).cloned();
+                match build_func_decl(&r, name, func_type(&r, fid), func_doc) {
+                    Ok(decl) => items.push(LibraryItem::Func(decl)),
+                    Err(e @ LibraryExtractError::Resource { .. }) => return Err(e),
+                    Err(_) => {}
                 }
-                items.push(LibraryItem::Interface {
-                    name: iface_name,
-                    export_name,
-                    doc: iface.docs.contents.clone(),
-                    funcs,
-                });
             }
-            WorldItem::Type { .. } => {
-                // Type aliases at the world level are not invocable.
+            ComponentEntityType::Instance(iid) => {
+                let short = iface_short_name(name);
+                if short == "exports" {
+                    continue;
+                }
+                let iface_ty = instance_type(&r, iid);
+                let iface_docs = docs.get(short.as_str());
+                match build_interface_funcs(&r, iface_ty, iface_docs) {
+                    Ok(funcs) if !funcs.is_empty() => {
+                        items.push(LibraryItem::Interface {
+                            name: short,
+                            export_name: name.clone(),
+                            doc: None,
+                            funcs,
+                        });
+                    }
+                    Err(e @ LibraryExtractError::Resource { .. }) => return Err(e),
+                    Ok(_) | Err(_) => {}
+                }
             }
+            // Module / Value / Type / Component exports aren't
+            // dispatchable through a CLI.
+            _ => {}
         }
     }
 
     Ok(LibrarySurface { items })
 }
 
-/// Convert a `wit_parser::Function` into a [`FuncDecl`].
-fn func_to_decl(
-    resolve: &Resolve,
+/// Output of the streaming walk over a component's bytes.
+struct WalkedComponent {
+    /// Validator output, the source of truth for all type queries.
+    types: wasmparser::types::Types,
+    /// Export names of the root component, in declaration order.
+    root_exports: Vec<String>,
+    /// Raw bytes of the `package-docs` custom section, if present.
+    package_docs: Option<Vec<u8>>,
+}
+
+/// Stream `bytes` through a [`Validator`] and collect the root
+/// component's export names plus its `package-docs` custom section.
+///
+/// The validator returns the fully-populated [`wasmparser::types::Types`]
+/// from its [`ValidPayload::End`] return on the outermost end payload;
+/// we capture that and never call `validator.end()` ourselves.
+fn walk_component(bytes: &[u8]) -> Result<WalkedComponent, LibraryExtractError> {
+    let mut validator = Validator::new_with_features(WasmFeatures::all());
+    let mut depth: u32 = 0;
+    let mut root_exports: Vec<String> = Vec::new();
+    let mut package_docs: Option<Vec<u8>> = None;
+    let mut types: Option<wasmparser::types::Types> = None;
+
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| LibraryExtractError::Decode(e.to_string()))?;
+        match &payload {
+            Payload::Version { encoding, .. } => {
+                if depth == 0 && *encoding != Encoding::Component {
+                    return Err(LibraryExtractError::NotAComponent);
+                }
+                depth += 1;
+            }
+            Payload::End(_) => {
+                depth = depth.saturating_sub(1);
+            }
+            Payload::ComponentExportSection(reader) if depth == 1 => {
+                for export in reader.clone() {
+                    let export = export.map_err(|e| LibraryExtractError::Decode(e.to_string()))?;
+                    root_exports.push(export.name.0.to_string());
+                }
+            }
+            Payload::CustomSection(cs) if depth == 1 && cs.name() == "package-docs" => {
+                package_docs = Some(cs.data().to_vec());
+            }
+            _ => {}
+        }
+        let valid = validator
+            .payload(&payload)
+            .map_err(|e| LibraryExtractError::Decode(e.to_string()))?;
+        if let ValidPayload::End(t) = valid {
+            types = Some(t);
+        }
+    }
+
+    let types = types
+        .ok_or_else(|| LibraryExtractError::Decode("validator produced no types".to_string()))?;
+    Ok(WalkedComponent {
+        types,
+        root_exports,
+        package_docs,
+    })
+}
+
+/// Build a [`FuncDecl`] from a validated [`ComponentFuncType`].
+fn build_func_decl(
+    r: &TypesRef<'_>,
     name: &str,
-    func: &wit_parser::Function,
+    func_ty: &ComponentFuncType,
+    doc: Option<String>,
 ) -> Result<FuncDecl, LibraryExtractError> {
-    let mut params = Vec::with_capacity(func.params.len());
-    for p in &func.params {
+    let mut params = Vec::with_capacity(func_ty.params.len());
+    for (pname, pty) in &func_ty.params {
         params.push(ParamDecl {
-            name: p.name.clone(),
-            ty: type_to_wit_ty(resolve, &p.ty)?,
+            name: pname.to_string(),
+            ty: cval_to_wit(r, pty)?,
         });
     }
-    let results = match &func.result {
+    let results = match &func_ty.result {
         Some(ty) => vec![ResultDecl {
-            ty: type_to_wit_ty(resolve, ty)?,
+            ty: cval_to_wit(r, ty)?,
         }],
         None => Vec::new(),
     };
     Ok(FuncDecl {
         name: name.to_string(),
-        doc: func.docs.contents.clone(),
+        doc,
         params,
         results,
     })
 }
 
-/// Convert a `wit_parser::Type` into a [`WitTy`].
-fn type_to_wit_ty(resolve: &Resolve, ty: &Type) -> Result<WitTy, LibraryExtractError> {
-    match ty {
-        Type::Bool => Ok(WitTy::Bool),
-        Type::S8 => Ok(WitTy::S8),
-        Type::S16 => Ok(WitTy::S16),
-        Type::S32 => Ok(WitTy::S32),
-        Type::S64 => Ok(WitTy::S64),
-        Type::U8 => Ok(WitTy::U8),
-        Type::U16 => Ok(WitTy::U16),
-        Type::U32 => Ok(WitTy::U32),
-        Type::U64 => Ok(WitTy::U64),
-        Type::F32 => Ok(WitTy::F32),
-        Type::F64 => Ok(WitTy::F64),
-        Type::Char => Ok(WitTy::Char),
-        Type::String => Ok(WitTy::String),
-        Type::ErrorContext => Err(LibraryExtractError::UnsupportedKind {
-            kind: "error-context",
-        }),
-        Type::Id(id) => {
-            let td = resolve
-                .types
-                .get(*id)
-                .ok_or_else(|| LibraryExtractError::Decode("type id not in resolve".to_string()))?;
-            type_def_to_wit_ty(resolve, td)
+/// Build [`FuncDecl`]s for every function export of an instance.
+///
+/// Non-function exports (nested types, sub-instances) are skipped;
+/// individual functions that use unsupported types are also skipped
+/// so a single odd export doesn't poison the whole interface. Handle
+/// (resource) types still surface as [`LibraryExtractError::Resource`]
+/// because they signal a fundamentally non-CLI-compatible shape.
+fn build_interface_funcs(
+    r: &TypesRef<'_>,
+    iface_ty: &ComponentInstanceType,
+    func_docs: Option<&HashMap<String, String>>,
+) -> Result<Vec<FuncDecl>, LibraryExtractError> {
+    let mut funcs = Vec::new();
+    for (fname, entity) in &iface_ty.exports {
+        let ComponentEntityType::Func(fid) = entity else {
+            continue;
+        };
+        let doc = func_docs.and_then(|m| m.get(fname.as_str())).cloned();
+        match build_func_decl(r, fname, func_type(r, *fid), doc) {
+            Ok(decl) => funcs.push(decl),
+            Err(e @ LibraryExtractError::Resource { .. }) => return Err(e),
+            Err(_) => {}
         }
+    }
+    Ok(funcs)
+}
+
+/// Map a [`ComponentValType`] to our local [`WitTy`] IR.
+fn cval_to_wit(r: &TypesRef<'_>, vt: &ComponentValType) -> Result<WitTy, LibraryExtractError> {
+    match vt {
+        ComponentValType::Primitive(p) => prim_to_wit(*p),
+        ComponentValType::Type(id) => defined_to_wit(r, defined_type(r, *id)),
     }
 }
 
-/// Convert a `wit_parser::TypeDef` into a [`WitTy`].
-fn type_def_to_wit_ty(
-    resolve: &Resolve,
-    td: &wit_parser::TypeDef,
+/// Look up a [`ComponentFuncType`] by id.
+///
+/// Type ids surfaced by `wasmparser::Validator` always resolve, so
+/// the underlying `Index` impl can't panic on us — the indirection
+/// here just isolates the one place clippy would otherwise flag.
+#[allow(clippy::indexing_slicing)]
+fn func_type<'a>(r: &'a TypesRef<'_>, id: ComponentFuncTypeId) -> &'a ComponentFuncType {
+    &r[id]
+}
+
+/// Look up a [`ComponentInstanceType`] by id. See [`func_type`].
+#[allow(clippy::indexing_slicing)]
+fn instance_type<'a>(
+    r: &'a TypesRef<'_>,
+    id: ComponentInstanceTypeId,
+) -> &'a ComponentInstanceType {
+    &r[id]
+}
+
+/// Look up a [`ComponentDefinedType`] by id. See [`func_type`].
+#[allow(clippy::indexing_slicing)]
+fn defined_type<'a>(r: &'a TypesRef<'_>, id: ComponentDefinedTypeId) -> &'a ComponentDefinedType {
+    &r[id]
+}
+
+/// Map a [`PrimitiveValType`] to our local [`WitTy`] IR.
+fn prim_to_wit(p: PrimitiveValType) -> Result<WitTy, LibraryExtractError> {
+    Ok(match p {
+        PrimitiveValType::Bool => WitTy::Bool,
+        PrimitiveValType::S8 => WitTy::S8,
+        PrimitiveValType::S16 => WitTy::S16,
+        PrimitiveValType::S32 => WitTy::S32,
+        PrimitiveValType::S64 => WitTy::S64,
+        PrimitiveValType::U8 => WitTy::U8,
+        PrimitiveValType::U16 => WitTy::U16,
+        PrimitiveValType::U32 => WitTy::U32,
+        PrimitiveValType::U64 => WitTy::U64,
+        PrimitiveValType::F32 => WitTy::F32,
+        PrimitiveValType::F64 => WitTy::F64,
+        PrimitiveValType::Char => WitTy::Char,
+        PrimitiveValType::String => WitTy::String,
+        PrimitiveValType::ErrorContext => {
+            return Err(LibraryExtractError::UnsupportedKind {
+                kind: "error-context",
+            });
+        }
+    })
+}
+
+/// Map a [`ComponentDefinedType`] to our local [`WitTy`] IR.
+fn defined_to_wit(
+    r: &TypesRef<'_>,
+    d: &ComponentDefinedType,
 ) -> Result<WitTy, LibraryExtractError> {
-    let resource_name = || td.name.clone().unwrap_or_else(|| "<anonymous>".to_string());
-    match &td.kind {
-        TypeDefKind::List(inner) => Ok(WitTy::List(Box::new(type_to_wit_ty(resolve, inner)?))),
-        TypeDefKind::Option(inner) => Ok(WitTy::Option(Box::new(type_to_wit_ty(resolve, inner)?))),
-        TypeDefKind::Result(r) => {
-            let ok = match &r.ok {
-                Some(t) => Some(Box::new(type_to_wit_ty(resolve, t)?)),
+    match d {
+        ComponentDefinedType::Primitive(p) => prim_to_wit(*p),
+        ComponentDefinedType::Record(rec) => {
+            let mut fields = Vec::with_capacity(rec.fields.len());
+            for (fname, fty) in &rec.fields {
+                fields.push((fname.to_string(), cval_to_wit(r, fty)?));
+            }
+            Ok(WitTy::Record(fields))
+        }
+        ComponentDefinedType::Variant(v) => {
+            let mut cases = Vec::with_capacity(v.cases.len());
+            for (cname, case) in &v.cases {
+                let payload = match &case.ty {
+                    Some(t) => Some(Box::new(cval_to_wit(r, t)?)),
+                    None => None,
+                };
+                cases.push((cname.to_string(), payload));
+            }
+            Ok(WitTy::Variant(cases))
+        }
+        ComponentDefinedType::List(t) => Ok(WitTy::List(Box::new(cval_to_wit(r, t)?))),
+        ComponentDefinedType::Option(t) => Ok(WitTy::Option(Box::new(cval_to_wit(r, t)?))),
+        ComponentDefinedType::Tuple(t) => {
+            let mut tys = Vec::with_capacity(t.types.len());
+            for v in &t.types {
+                tys.push(cval_to_wit(r, v)?);
+            }
+            Ok(WitTy::Tuple(tys))
+        }
+        ComponentDefinedType::Enum(s) => {
+            Ok(WitTy::Enum(s.iter().map(ToString::to_string).collect()))
+        }
+        ComponentDefinedType::Flags(s) => {
+            Ok(WitTy::Flags(s.iter().map(ToString::to_string).collect()))
+        }
+        ComponentDefinedType::Result { ok, err } => {
+            let ok = match ok {
+                Some(t) => Some(Box::new(cval_to_wit(r, t)?)),
                 None => None,
             };
-            let err = match &r.err {
-                Some(t) => Some(Box::new(type_to_wit_ty(resolve, t)?)),
+            let err = match err {
+                Some(t) => Some(Box::new(cval_to_wit(r, t)?)),
                 None => None,
             };
             Ok(WitTy::Result { ok, err })
         }
-        TypeDefKind::Record(rec) => {
-            let mut fields = Vec::with_capacity(rec.fields.len());
-            for f in &rec.fields {
-                fields.push((f.name.clone(), type_to_wit_ty(resolve, &f.ty)?));
-            }
-            Ok(WitTy::Record(fields))
+        ComponentDefinedType::Own(_) | ComponentDefinedType::Borrow(_) => {
+            Err(LibraryExtractError::Resource {
+                name: "<anonymous>".to_string(),
+            })
         }
-        TypeDefKind::Variant(v) => {
-            let mut cases = Vec::with_capacity(v.cases.len());
-            for c in &v.cases {
-                let payload = match &c.ty {
-                    Some(t) => Some(Box::new(type_to_wit_ty(resolve, t)?)),
-                    None => None,
-                };
-                cases.push((c.name.clone(), payload));
-            }
-            Ok(WitTy::Variant(cases))
+        ComponentDefinedType::Future(_) => {
+            Err(LibraryExtractError::UnsupportedKind { kind: "future" })
         }
-        TypeDefKind::Enum(e) => Ok(WitTy::Enum(
-            e.cases.iter().map(|c| c.name.clone()).collect(),
-        )),
-        TypeDefKind::Flags(f) => Ok(WitTy::Flags(
-            f.flags.iter().map(|fl| fl.name.clone()).collect(),
-        )),
-        TypeDefKind::Tuple(t) => {
-            let mut tys = Vec::with_capacity(t.types.len());
-            for inner in &t.types {
-                tys.push(type_to_wit_ty(resolve, inner)?);
-            }
-            Ok(WitTy::Tuple(tys))
+        ComponentDefinedType::Stream(_) => {
+            Err(LibraryExtractError::UnsupportedKind { kind: "stream" })
         }
-        TypeDefKind::Type(inner) => type_to_wit_ty(resolve, inner),
-        TypeDefKind::Resource | TypeDefKind::Handle(_) => Err(LibraryExtractError::Resource {
-            name: resource_name(),
-        }),
-        TypeDefKind::Future(_) => Err(LibraryExtractError::UnsupportedKind { kind: "future" }),
-        TypeDefKind::Stream(_) => Err(LibraryExtractError::UnsupportedKind { kind: "stream" }),
-        TypeDefKind::Map(_, _) => Err(LibraryExtractError::UnsupportedKind { kind: "map" }),
-        TypeDefKind::FixedLengthList(_, _) => Err(LibraryExtractError::UnsupportedKind {
+        ComponentDefinedType::Map(_, _) => {
+            Err(LibraryExtractError::UnsupportedKind { kind: "map" })
+        }
+        ComponentDefinedType::FixedLengthList(_, _) => Err(LibraryExtractError::UnsupportedKind {
             kind: "fixed-length-list",
         }),
-        TypeDefKind::Unknown => Err(LibraryExtractError::UnsupportedKind { kind: "unknown" }),
     }
 }
 
-/// Best-effort name for an interface export, used as the clap
-/// sub-command name.
-fn world_key_label(resolve: &Resolve, key: &WorldKey, iface_name: Option<&str>) -> String {
-    match key {
-        WorldKey::Name(name) => name.clone(),
-        WorldKey::Interface(id) => {
-            if let Some(iface) = resolve.interfaces.get(*id)
-                && let Some(name) = iface.name.as_deref()
-            {
-                return name.to_string();
-            }
-            iface_name.unwrap_or("interface").to_string()
-        }
-    }
+/// Extract the short, user-facing interface name from a fully-
+/// qualified export name like `local:time-server/time@0.1.0`.
+///
+/// Falls back to the full name when the format doesn't match (e.g.
+/// inline `WorldKey::Name` style exports).
+fn iface_short_name(export_name: &str) -> String {
+    let after_slash = export_name.rsplit('/').next().unwrap_or(export_name);
+    after_slash
+        .split('@')
+        .next()
+        .unwrap_or(after_slash)
+        .to_string()
 }
 
-/// Compute the fully-qualified export name wasmtime uses for an
-/// interface export. For named world keys (declared inline) it is
-/// just the bare name; for `WorldKey::Interface(id)` it's
-/// `namespace:pkg/iface@version`.
-fn world_key_export_name(
-    resolve: &Resolve,
-    key: &WorldKey,
-    iface: &wit_parser::Interface,
-) -> String {
-    match key {
-        WorldKey::Name(name) => name.clone(),
-        WorldKey::Interface(_) => {
-            let name = iface.name.as_deref().unwrap_or("interface");
-            let Some(pkg_id) = iface.package else {
-                return name.to_string();
-            };
-            let Some(pkg) = resolve.packages.get(pkg_id) else {
-                return name.to_string();
-            };
-            let pname = &pkg.name;
-            match &pname.version {
-                Some(v) => format!("{}:{}/{name}@{v}", pname.namespace, pname.name),
-                None => format!("{}:{}/{name}", pname.namespace, pname.name),
+/// Parse a `package-docs` custom section into a flat map of
+/// `interface short name -> { func name -> doc string }`.
+///
+/// The map uses the empty string `""` as the key for top-level
+/// (free) function docs. Unknown JSON shapes are silently ignored
+/// — docs are a best-effort enhancement, never a hard requirement.
+fn parse_package_docs(raw: Option<&[u8]>) -> HashMap<String, HashMap<String, String>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let Some(bytes) = raw else { return out };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return out;
+    };
+    if let Some(top_funcs) = json.get("funcs").and_then(|v| v.as_object()) {
+        let entry = out.entry(String::new()).or_default();
+        for (fname, fobj) in top_funcs {
+            if let Some(doc) = fobj.get("docs").and_then(|d| d.as_str()) {
+                entry.insert(fname.clone(), doc.to_string());
             }
         }
     }
+    if let Some(ifaces) = json.get("interfaces").and_then(|v| v.as_object()) {
+        for (iname, iobj) in ifaces {
+            let Some(funcs) = iobj.get("funcs").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let entry = out.entry(iname.clone()).or_default();
+            for (fname, fobj) in funcs {
+                if let Some(doc) = fobj.get("docs").and_then(|d| d.as_str()) {
+                    entry.insert(fname.clone(), doc.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
