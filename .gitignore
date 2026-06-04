@@ -9,3 +9,4 @@ Cargo.lock
 registry.toml
 wasm.lock.toml
 wasm.toml
+tmp.sh

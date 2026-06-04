@@ -37,3 +37,7 @@ build:
 # Run the full test suite (fmt + clippy + tests + sql check)
 test:
     cargo xtask test
+
+# Run tmp.sh under the parent shell's gh auth (uses unset GH_TOKEN)
+tmp:
+    @bash tmp.sh
