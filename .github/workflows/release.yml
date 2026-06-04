@@ -108,9 +108,9 @@ jobs:
               raise SystemExit("Failed to update [workspace.package] version in Cargo.toml")
           # Also update versions of local path dependencies so they match the
           # new workspace version (otherwise cargo rejects the mismatched constraint).
+          _dep_re = re.compile(r'^\s*[\w-]+\s*=\s*\{[^}]*path\s*=\s*"crates/')
           def update_local_dep_version(line):
-              stripped = line.lstrip()
-              if stripped and not stripped.startswith('#') and 'path = "crates/' in stripped:
+              if _dep_re.search(line.split('#')[0]):
                   return re.sub(r'(version\s*=\s*")[^"]*', r'\g<1>' + version, line)
               return line
           new_text = "\n".join(update_local_dep_version(line) for line in new_text.split("\n"))
